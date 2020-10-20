@@ -53,17 +53,28 @@ import (
 type SharedInformerOption func(*sharedInformerFactory) *sharedInformerFactory
 
 type sharedInformerFactory struct {
-	client           kubernetes.Interface
-	namespace        string
-	tweakListOptions internalinterfaces.TweakListOptionsFunc
-	lock             sync.Mutex
-	defaultResync    time.Duration
-	customResync     map[reflect.Type]time.Duration
+	client            kubernetes.Interface
+	namespace         string
+	tweakListOptions  internalinterfaces.TweakListOptionsFunc
+	lock              sync.Mutex
+	defaultResync     time.Duration
+	customResync      map[reflect.Type]time.Duration
+	customStopOptions map[reflect.Type]cache.StopOptions
 
 	informers map[reflect.Type]cache.SharedIndexInformer
 	// startedInformers is used for tracking which informers have been started.
 	// This allows Start() to be called multiple times safely.
 	startedInformers map[reflect.Type]bool
+}
+
+// WithCustomStopOptions sets a StopOptions for each for the specified informer type.
+func WithCustomStopOptions(stopOptionsConfig map[reflect.Type]cache.StopOptions) SharedInformerOption {
+	return func(factory *sharedInformerFactory) *sharedInformerFactory {
+		for k, v := range stopOptionsConfig {
+			factory.customStopOptions[reflect.TypeOf(k)] = v
+		}
+		return factory
+	}
 }
 
 // WithCustomResyncConfig sets a custom resync period for the specified informer types.
@@ -108,12 +119,13 @@ func NewFilteredSharedInformerFactory(client kubernetes.Interface, defaultResync
 // NewSharedInformerFactoryWithOptions constructs a new instance of a SharedInformerFactory with additional options.
 func NewSharedInformerFactoryWithOptions(client kubernetes.Interface, defaultResync time.Duration, options ...SharedInformerOption) SharedInformerFactory {
 	factory := &sharedInformerFactory{
-		client:           client,
-		namespace:        v1.NamespaceAll,
-		defaultResync:    defaultResync,
-		informers:        make(map[reflect.Type]cache.SharedIndexInformer),
-		startedInformers: make(map[reflect.Type]bool),
-		customResync:     make(map[reflect.Type]time.Duration),
+		client:            client,
+		namespace:         v1.NamespaceAll,
+		defaultResync:     defaultResync,
+		informers:         make(map[reflect.Type]cache.SharedIndexInformer),
+		startedInformers:  make(map[reflect.Type]bool),
+		customResync:      make(map[reflect.Type]time.Duration),
+		customStopOptions: make(map[reflect.Type]cache.StopOptions),
 	}
 
 	// Apply all options
@@ -133,6 +145,50 @@ func (f *sharedInformerFactory) Start(stopCh <-chan struct{}) {
 		if !f.startedInformers[informerType] {
 			go informer.Run(stopCh)
 			f.startedInformers[informerType] = true
+		}
+	}
+}
+
+// informerStopped removes a stopped informer from the factory's list
+// of informers and started informers.
+func (f *sharedInformerFactory) informerStopped(informerType reflect.Type) {
+	f.lock.Lock()
+	defer f.lock.Unlock()
+	delete(f.startedInformers, informerType)
+	delete(f.informers, informerType)
+}
+
+// StartWithStopOptions initializes all requested informers with the stop options provided, defaulting to
+// the old stop options (only stopping via closure of stopCh).
+// It makes sure remove an informer from the list of informers and started informers when the informer is stopped
+// to prevent a race where InformerFor gives the user back a stopped informer that will never be started again.
+func (f *sharedInformerFactory) StartWithStopOptions(stopCh <-chan struct{}) {
+	f.lock.Lock()
+	defer f.lock.Unlock()
+
+	for informerType, informer := range f.informers {
+		if !f.startedInformers[informerType] {
+			var stopOptions cache.StopOptions
+			if opts, ok := f.customStopOptions[informerType]; ok {
+				// TODO: is it safe to overwrite the externalStop?
+				// How do we ensure creator of stopopts isn't adding a stopCh that they expect to be used?
+				// Should we merge them instead?
+				stopOptions = opts
+
+			} else {
+				// default to old behavior of never stopping.
+				stopOptions = cache.StopOptions{
+					OnListError: func(err error) bool {
+						return false
+					},
+				}
+			}
+			stopOptions.ExternalStop = stopCh
+
+			go func() {
+				defer f.informerStopped(informerType)
+				informer.RunWithStopOptions(stopOptions)
+			}()
 		}
 	}
 }
